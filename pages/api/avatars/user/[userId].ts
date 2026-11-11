@@ -1,0 +1,59 @@
+import { AvatarService } from '../../../../src/lib/services/avatar-service';
+import { rateLimit } from '../../../../src/lib/api/rate-limit';
+import { getPool } from '../../../../src/lib/database/pool';
+import { requireAuth } from '../../../../src/lib/auth/auth-utils';
+import { apiHandler } from '../../../../src/lib/api/handler';
+
+export default apiHandler({ methods: 'GET' }, async (req, res) => {
+  const ip = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'anon';
+  const rl = rateLimit(`GET /api/avatars/user/:userId:${ip}`, { windowMs: 60 * 1000, max: 60 });
+  if (!rl.allowed) return res.status(429).json({ error: 'Too many requests. Please slow down.' });
+
+  try {
+    let { userId } = req.query as { userId: string };
+    
+    console.log('=== Avatar Retrieval API Debug ===');
+    console.log('Looking up avatar for userId:', userId);
+    console.log('This is the userId that will be queried in database');
+    console.log('=== Retrieval API Processing ===');
+    
+    // Support 'me' to resolve from authenticated session
+    if (userId === 'me' || userId === 'current-user') {
+      try {
+        const authedUserId = await requireAuth(req);
+        userId = authedUserId;
+        console.log('Resolved userId from auth context:', userId);
+      } catch (e) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+    }
+
+    // Use shared pool config (honors DB_MODE/local settings)
+    const pool = getPool();
+    const service = new AvatarService(pool as any);
+    const avatar = await service.getLatestForUser(userId);
+    
+    console.log('=== Avatar Retrieval Result ===');
+    console.log('Query result for userId', userId + ':', avatar ? 'Found avatar' : 'No avatar found');
+    if (avatar) {
+      // console.log('Avatar data found:', { id: avatar.id, url: avatar.originalUrl, status: avatar.status });
+    }
+    console.log('=== End Retrieval Result ===');
+    
+    if (!avatar) {
+      console.log('Avatar API - Returning 404 for userId:', userId);
+      return res.status(404).json({ error: 'Not found' });
+    }
+    return res.status(200).json({ id: avatar.id, url: avatar.originalUrl, thumbnails: avatar.variants, status: avatar.status });
+  } catch (e: any) {
+    console.error('Avatar API error:', e);
+    
+    // Specific handling for SSL certificate errors
+    if (e.code === 'SELF_SIGNED_CERT_IN_CHAIN' || e.message?.includes('certificate')) {
+      console.error('SSL Certificate issue - check database SSL configuration');
+      return res.status(500).json({ error: 'Database SSL configuration error' });
+    }
+    
+    return res.status(500).json({ error: e?.message || 'Internal error' });
+  }
+});

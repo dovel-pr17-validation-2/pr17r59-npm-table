@@ -1,0 +1,17 @@
+node_modules
+.temp
+.env.local
+.next
+coverage
+tsconfig.tsbuildinfo
+
+# Playwright
+test-results/
+playwright-report/
+playwright/.cache/
+# Ignore ad-hoc test files in root directory
+test-*.js
+test-*.ts
+
+# Written by next dev / next build (paths differ between the two)
+next-env.d.ts

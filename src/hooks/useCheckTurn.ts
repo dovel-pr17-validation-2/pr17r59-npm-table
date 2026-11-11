@@ -1,0 +1,146 @@
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { authHeaders } from '../utils/auth-headers';
+import { usePolling } from './usePolling';
+
+interface TurnStatus {
+  isMyTurn: boolean;
+  activePlayer: string;
+  tableState: string;
+  handNumber: number;
+  paused?: boolean;
+  turnSeq?: number;
+}
+
+interface UseCheckTurnOptions {
+  /** Polling interval in milliseconds. Default: 10000 (10 seconds) */
+  interval?: number;
+  /** Enable/disable polling. Default: true */
+  enabled?: boolean;
+  /** Callback when turn status changes */
+  onTurnChange?: (status: TurnStatus) => void;
+}
+
+/**
+ * Hook that polls the server to check if it's the player's turn.
+ * 
+ * This provides a fallback mechanism alongside Supabase Realtime notifications,
+ * ensuring players are notified of their turn even if websocket messages are missed.
+ * 
+ * Polling continues as long as `enabled` is true. Callers can stop polling when it
+ * becomes the player's turn (to reduce load) and resume when the turn changes by
+ * toggling the `enabled` option.
+ * 
+ * @param tableId - The table/room ID
+ * @param playerId - The current player's ID
+ * @param options - Configuration options
+ * @returns Current turn status and loading/error states
+ */
+export function useCheckTurn(
+  tableId: string | undefined,
+  playerId: string | undefined,
+  options: UseCheckTurnOptions = {}
+) {
+  const { interval = 10000, enabled = true, onTurnChange } = options;
+  
+  const [turnStatus, setTurnStatus] = useState<TurnStatus | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  
+  const previousTurnStatusRef = useRef<TurnStatus | null>(null);
+  // Kept in a ref: callers pass an inline function, and a new one each render must not restart
+  // polling (it used to, which fired a request on every render)
+  const onTurnChangeRef = useRef(onTurnChange);
+  onTurnChangeRef.current = onTurnChange;
+  const isCheckingRef = useRef(false);
+  const isMountedRef = useRef(true);
+
+  const checkTurn = useCallback(async () => {
+    // Prevent concurrent checks
+    if (isCheckingRef.current) return;
+    if (!tableId || !playerId) return;
+    
+    isCheckingRef.current = true;
+    setIsLoading(true);
+    setError(null);
+
+    const abortController = new AbortController();
+
+    try {
+      const response = await fetch(
+        `/api/games/check-turn?tableId=${encodeURIComponent(tableId)}&playerId=${encodeURIComponent(playerId)}`,
+        { signal: abortController.signal, headers: authHeaders() }
+      );
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({ error: 'Unknown error' }));
+        throw new Error(data.error || `HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      
+      // Only update state if component is still mounted
+      if (!isMountedRef.current) return;
+      
+      if (data.success) {
+        const newStatus: TurnStatus = {
+          isMyTurn: data.isMyTurn,
+          activePlayer: data.activePlayer,
+          tableState: data.tableState,
+          handNumber: data.handNumber,
+          ...(typeof data.paused === 'boolean' ? { paused: data.paused } : {}),
+          ...(typeof data.turnSeq === 'number' ? { turnSeq: data.turnSeq } : {}),
+        };
+        
+        setTurnStatus(newStatus);
+        
+        // Check if turn status changed
+        const prev = previousTurnStatusRef.current;
+        if (prev && (
+          prev.isMyTurn !== newStatus.isMyTurn ||
+          prev.activePlayer !== newStatus.activePlayer ||
+          prev.tableState !== newStatus.tableState ||
+          prev.handNumber !== newStatus.handNumber ||
+          prev.paused !== newStatus.paused ||
+          prev.turnSeq !== newStatus.turnSeq
+        )) {
+          onTurnChangeRef.current?.(newStatus);
+        }
+        
+        previousTurnStatusRef.current = newStatus;
+      }
+    } catch (err) {
+      // Ignore abort errors
+      if (err instanceof Error && err.name === 'AbortError') return;
+      
+      // Only update error state if component is still mounted
+      if (!isMountedRef.current) return;
+      
+      const errorMsg = err instanceof Error ? err.message : 'Failed to check turn status';
+      setError(errorMsg);
+      console.error('[useCheckTurn] Error:', errorMsg);
+    } finally {
+      if (isMountedRef.current) {
+        setIsLoading(false);
+      }
+      isCheckingRef.current = false;
+    }
+  }, [tableId, playerId]);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  // Paused while the tab is hidden or the user is idle
+  usePolling(checkTurn, interval, { enabled: enabled && !!tableId && !!playerId });
+
+  return {
+    turnStatus,
+    isLoading,
+    error,
+    /** Manually trigger a turn check (useful for testing or forced refresh) */
+    checkNow: checkTurn
+  };
+}

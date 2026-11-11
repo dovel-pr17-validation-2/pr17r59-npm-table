@@ -1,0 +1,49 @@
+import type { NextApiRequest, NextApiResponse } from 'next';
+
+import listRitHandler from '../../../pages/api/history/run-it-twice/list';
+
+jest.mock('../../../src/lib/database/pool', () => ({ getPool: jest.fn(() => ({})) }));
+
+jest.mock('../../../src/lib/api/rate-limit', () => ({
+  rateLimit: jest.fn().mockReturnValue({ allowed: true, remaining: 1, resetAt: Date.now() + 60000 })
+}));
+
+const mockService: any = {
+  listRunItTwiceOutcomes: jest.fn(),
+};
+
+jest.mock('../../../src/lib/services/hand-history-service', () => ({
+  HandHistoryService: jest.fn().mockImplementation(() => mockService)
+}));
+
+function createRes() {
+  const res: Partial<NextApiResponse> & { status: jest.Mock; json: jest.Mock } = {
+    status: jest.fn().mockReturnThis(),
+    json: jest.fn()
+  } as any;
+  return res;
+}
+
+function createReq(method: string, body?: any, query?: any): Partial<NextApiRequest> {
+  return {
+    method,
+    body,
+    query,
+    headers: {},
+    socket: { remoteAddress: '127.0.0.1' } as any
+  } as any;
+}
+
+describe('Hand History API (US-021)', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('GET /api/history/run-it-twice/list', async () => {
+    const list = [] as any;
+    mockService.listRunItTwiceOutcomes.mockResolvedValue(list);
+    const req = createReq('GET', undefined, { handId: 'h1' });
+    const res = createRes();
+    await listRitHandler(req as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith(list);
+  });
+});

@@ -1,0 +1,75 @@
+{
+  "name": "table",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint pages src",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:headed": "playwright test --headed",
+    "test:e2e:debug": "playwright test --debug",
+    "test:smoke": "playwright test --grep @smoke",
+    "heroku-postbuild": "echo Skipping heroku-postbuild for Koyeb",
+    "db:migrate": "node scripts/db-migrate.js"
+  },
+  "dependencies": {
+    "@sendgrid/mail": "^8.1.5",
+    "@supabase/supabase-js": "^2.0.0",
+    "@tailwindcss/postcss": "^4.3.5",
+    "@types/formidable": "^3.4.5",
+    "@types/node": "^22.20.5",
+    "@types/nodemailer": "^8.0.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vercel/analytics": "^2.0.1",
+    "dotenv": "^18.0.9",
+    "formidable": "^3.5.4",
+    "ioredis": "^6.0.0",
+    "next": "^16.4.6",
+    "nodemailer": "^10.4.0",
+    "pokersolver": "^2.1.4",
+    "postcss": "^8.0.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "tailwindcss": "^4.3.5",
+    "ts-node": "^10.9.2",
+    "typescript": "~5.9.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.57.0",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@types/jest": "^30.0.0",
+    "@types/pg": "^8.15.5",
+    "bcryptjs": "^3.0.2",
+    "cross-env": "^10.0.0",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "^16.4.6",
+    "jest": "^30.5.2",
+    "jest-environment-jsdom": "^30.0.5",
+    "pg": "^8.16.3",
+    "ts-jest": "^29.4.1"
+  },
+  "description": "",
+  "main": "postcss.config.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/elevow/table.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/elevow/table/issues"
+  },
+  "homepage": "https://github.com/elevow/table#readme"
+}

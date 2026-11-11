@@ -1,0 +1,33 @@
+version: 2
+updates:
+  # npm packages: one weekly PR for the safe minor and patch updates, separate PRs for major versions
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # Type definitions follow the Node version the app runs on (22 in CI and on Vercel). Raise
+      # this together with the runtime.
+      - dependency-name: '@types/node'
+        versions: ['>= 23']
+      # TypeScript 7 is the new native compiler; ts-jest supports TypeScript below 7 only
+      - dependency-name: typescript
+        versions: ['>= 7']
+
+  # Actions used by the workflows
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns:
+          - '*'

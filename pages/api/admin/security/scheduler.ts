@@ -1,0 +1,24 @@
+import { SecurityScheduler } from '../../../../src/lib/security/security-scheduler';
+import { initSecuritySchedulerDb } from '../../../../src/lib/security/security-scheduler-db';
+import { rateLimit } from '../../../../src/lib/api/rate-limit';
+import { requirePermission } from '../../../../src/lib/auth/access-control';
+import { apiHandler } from '../../../../src/lib/api/handler';
+
+export default apiHandler({ methods: ['GET', 'POST'] }, async (req, res) => {
+  // Ensure the scheduler uses DB-backed fetcher in this runtime
+  initSecuritySchedulerDb();
+  const rl = rateLimit(req, { limit: 60, windowMs: 60_000 });
+  if (!rl.allowed) return res.status(429).json({ error: 'Too many requests' });
+  if (!(await requirePermission(req, res, 'admin.security.config'))) return;
+  if (req.method === 'POST') {
+    const { action } = req.body || {};
+    if (action === 'start') { SecurityScheduler.start(); return res.status(200).json({ started: true }); }
+    if (action === 'stop') { SecurityScheduler.stop(); return res.status(200).json({ stopped: true }); }
+    if (action === 'runOnce') { await SecurityScheduler.runOnce(); return res.status(200).json({ ran: true, lastRun: SecurityScheduler.getLastRun() }); }
+    return res.status(400).json({ error: 'Invalid action' });
+  }
+  if (req.method === 'GET') {
+    return res.status(200).json({ lastRun: SecurityScheduler.getLastRun() });
+  }
+  return res.status(405).json({ error: 'Method not allowed' });
+});

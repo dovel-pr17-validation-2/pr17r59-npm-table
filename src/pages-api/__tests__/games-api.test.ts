@@ -1,0 +1,114 @@
+import type { NextApiRequest, NextApiResponse } from 'next';
+
+import createRoomHandler from '../../../pages/api/games/rooms/create';
+import listRoomsHandler from '../../../pages/api/games/rooms/list';
+import byRoomHandler from '../../../pages/api/games/active/by-room';
+
+// Mock pool module to avoid database connection
+const mockPool: any = {};
+jest.mock('../../../src/lib/database/pool', () => ({
+  getPool: jest.fn(() => mockPool)
+}));
+
+// Every room here is public; private-room checks have their own tests
+jest.mock('../../../src/lib/server/room-privacy', () => ({
+  ...jest.requireActual('../../../src/lib/server/room-privacy'),
+  guardRoomEntry: jest.fn().mockResolvedValue(true),
+}));
+
+jest.mock('../../../src/lib/api/rate-limit', () => ({
+  rateLimit: jest.fn().mockReturnValue({ allowed: true, remaining: 1, resetAt: Date.now() + 60000 })
+}));
+
+const mockService: any = {
+  createRoom: jest.fn(),
+  listRooms: jest.fn(),
+  getActiveGameByRoom: jest.fn(),
+};
+
+jest.mock('../../../src/lib/services/game-service', () => ({
+  GameService: jest.fn().mockImplementation(() => mockService)
+}));
+
+// Mock auth to always return a valid user id
+jest.mock('../../../src/lib/auth/auth-utils', () => ({
+  requirePlayer: jest.fn().mockResolvedValue('test-user-id'),
+  getAuthenticatedUserId: jest.fn().mockResolvedValue(null)
+}));
+// Room creation reads the caller's access; this user may create rooms
+jest.mock('../../../src/lib/auth/access-control', () => ({
+  requirePlayerAccess: jest.fn().mockResolvedValue({ userId: 'test-user-id', permissions: new Set(['room.create']) }),
+  hasPermission: (access: { permissions: Set<string> }, permission: string) => access.permissions.has(permission),
+  sendPermissionDenied: (res: any) => res.status(403).json({ code: 'PERMISSION_DENIED' }),
+  getLimit: () => null,
+  sendLimitReached: jest.fn(),
+}));
+
+function createRes() {
+  const res: Partial<NextApiResponse> & { status: jest.Mock; json: jest.Mock } = {
+    status: jest.fn().mockReturnThis(),
+    json: jest.fn()
+  } as any;
+  return res;
+}
+
+function createReq(method: string, body?: any, query?: any): Partial<NextApiRequest> {
+  return {
+    method,
+    body,
+    query,
+    headers: {},
+    socket: { remoteAddress: '127.0.0.1' } as any
+  } as any;
+}
+
+// Saved engine state as stored in active_games; it must never reach an API response
+const ENGINE_STATE = {
+  tableState: { players: [{ id: 'p1', holeCards: [{ rank: 'A', suit: 'spades' }, { rank: 'K', suit: 'spades' }] }] },
+  deck: [{ rank: '2', suit: 'hearts' }],
+};
+
+describe('Games API routes (US-020)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test('POST /api/games/rooms/create', async () => {
+    const payload = { id: 'r1', name: 'T1', status: 'waiting' } as any;
+    mockService.createRoom.mockResolvedValue(payload);
+    const req = createReq('POST', { name: 'T1', gameType: 'NLH', maxPlayers: 6, blindLevels: {}, createdBy: 'u1' });
+    const res = createRes();
+    await createRoomHandler(req as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(201);
+    expect(res.json).toHaveBeenCalledWith(payload);
+  });
+
+  test('GET /api/games/rooms/list', async () => {
+    const data = { items: [], total: 0, page: 1, limit: 20, totalPages: 0 } as any;
+    mockService.listRooms.mockResolvedValue(data);
+    const req = createReq('GET', undefined, { page: '1', limit: '20' });
+    const res = createRes();
+    await listRoomsHandler(req as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith(data);
+  });
+
+  test('GET /api/games/active/by-room', async () => {
+    const game = { id: 'g1', roomId: 'r1', state: ENGINE_STATE } as any;
+    mockService.getActiveGameByRoom.mockResolvedValue(game);
+    const req = createReq('GET', undefined, { roomId: 'r1' });
+    const res = createRes();
+    await byRoomHandler(req as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith({ id: 'g1', roomId: 'r1' });
+  });
+
+  test('GET /api/games/active/by-room returns null when no game exists', async () => {
+    mockService.getActiveGameByRoom.mockResolvedValue(null);
+    const req = createReq('GET', undefined, { roomId: 'r1' });
+    const res = createRes();
+    await byRoomHandler(req as any, res as any);
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith(null);
+  });
+});

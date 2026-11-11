@@ -1,0 +1,216 @@
+import { publishRebuyResult, publishSeatState, publishSeatVacated, publishGameStateUpdate } from '../../../src/lib/realtime/publisher';
+import {
+  BASE_REBUY_CHIPS,
+  clearPendingRebuy,
+  getRebuyAvailability,
+  pendingRebuyCount,
+} from '../../../src/lib/server/rebuy-state';
+import { fetchRoomRebuyAmount } from '../../../src/lib/shared/rebuy-limit';
+import { recordBuyin } from '../../../src/lib/shared/rebuy-tracker';
+import * as GameSeats from '../../../src/lib/shared/game-seats';
+import { nextSeq } from '../../../src/lib/realtime/sequence';
+import { clearRunItState, enrichStateWithRunIt } from '../../../src/lib/poker/run-it-twice-manager';
+import { getOrRestoreEngine, persistEngineState, STALE_STATE_RESPONSE } from '../../../src/lib/poker/engine-persistence';
+import { requirePlayer } from '../../../src/lib/auth/auth-utils';
+import { recordLedger } from '../../../src/lib/server/chip-ledger';
+import { syncWaitlist } from '../../../src/lib/server/seat-actions';
+import { sanitizeStateForBroadcast } from '../../../src/lib/poker/state-sanitizer';
+import { apiHandler } from '../../../src/lib/api/handler';
+
+/**
+ * After a rebuy decision, check if we can start the next hand.
+ * We need at least 2 players with chips > 0 and no pending rebuy prompts.
+ */
+async function maybeStartNextHand(tableId: string, engine: any): Promise<boolean> {
+  if (!engine || typeof engine.getState !== 'function') {
+    return false;
+  }
+
+  const state = engine.getState();
+  if (!state || !Array.isArray(state.players)) {
+    return false;
+  }
+
+  // Only auto-start if we're in showdown stage (hand is over)
+  if (state.stage !== 'showdown') {
+    return false;
+  }
+
+  // Count players with money
+  const playersWithMoney = state.players.filter((p: any) => (Number(p.stack) || 0) > 0);
+  const pendingCount = pendingRebuyCount(tableId);
+
+  console.log(`[rebuy-decision] Players with money: ${playersWithMoney.length}, pending rebuys: ${pendingCount}`);
+
+  // Need at least 2 players with money and no pending rebuy decisions
+  const enoughSittingIn = !state.paused && (typeof engine.canStartNewHand !== 'function' || engine.canStartNewHand());
+  if (playersWithMoney.length >= 2 && pendingCount === 0 && enoughSittingIn) {
+    console.log(`[rebuy-decision] Starting next hand for table ${tableId}`);
+    
+    // Clear Run-It-Twice state for new hand
+    clearRunItState(tableId);
+
+    // Start the next hand
+    if (typeof engine.startNewHand === 'function') {
+      engine.startNewHand();
+      
+      // Persist engine state for serverless recovery; on a conflict another request owns the table
+      if ((await persistEngineState(tableId, engine)) === 'conflict') {
+        return false;
+      }
+      
+      const newState = engine.getState();
+      const enrichedState = enrichStateWithRunIt(tableId, newState);
+      const sequence = nextSeq(tableId);
+
+      // The table channel is shared, so it must never carry anyone's hidden cards
+      await publishGameStateUpdate(tableId, {
+        gameState: sanitizeStateForBroadcast(enrichedState),
+        seq: sequence,
+        lastAction: { action: 'next_hand_started', playerId: 'system', reason: 'rebuy_complete' },
+        timestamp: new Date().toISOString(),
+      });
+
+      return true;
+    }
+  }
+
+  return false;
+}
+
+export default apiHandler({ methods: 'POST' }, async (req, res) => {
+  try {
+    const { tableId, playerId: claimedPlayerId, decision } = req.body;
+
+    const playerId = await requirePlayer(req, res, claimedPlayerId, decision === 'yes' ? 'game.rebuy' : undefined);
+    if (!playerId) return;
+
+    if (!tableId || (decision !== 'yes' && decision !== 'no')) {
+      return res.status(400).json({ error: 'Missing or invalid parameters' });
+    }
+
+    const engine = await getOrRestoreEngine(tableId);
+
+    if (decision === 'yes') {
+      // Rebuys are offered only between hands to a player with no chips left. This is checked
+      // against the saved game, since the pending-prompt list lives in one server's memory.
+      const state = engine && typeof engine.getState === 'function' ? engine.getState() : undefined;
+      const tablePlayer = state?.players?.find((p: { id: string }) => p.id === playerId);
+      if (!engine || !state || state.stage !== 'showdown' || !tablePlayer || (Number(tablePlayer.stack) || 0) > 0) {
+        return res.status(409).json({ error: 'Rebuy is only available between hands after losing all your chips' });
+      }
+
+      const availability = await getRebuyAvailability(tableId, playerId);
+      if (!availability.canRebuy) {
+        return res.status(403).json({ error: 'Rebuy limit reached', ...availability });
+      }
+
+      // Fetch the rebuy amount for this room
+      const rebuyChips = await fetchRoomRebuyAmount(tableId);
+
+      // Give the player the chips and save before recording the rebuy, so a rebuy is only
+      // counted once the new stack is stored
+      tablePlayer.stack = rebuyChips;
+      tablePlayer.currentBet = 0;
+      tablePlayer.isAllIn = false;
+      tablePlayer.isFolded = false;
+      tablePlayer.hasActed = false;
+      if ((await persistEngineState(tableId, engine)) === 'conflict') {
+        return res.status(409).json(STALE_STATE_RESPONSE);
+      }
+
+      // Record the rebuy
+      const trackerRecord = recordBuyin(tableId, playerId);
+      await recordLedger({ roomId: tableId, playerId, playerName: tablePlayer.name, kind: 'rebuy', amount: rebuyChips });
+      clearPendingRebuy(tableId, playerId);
+
+      // Update seat assignment
+      const seats = await GameSeats.loadPersistedRoomSeats(tableId) || GameSeats.getRoomSeats(tableId);
+      for (const [seatStr, assignment] of Object.entries(seats)) {
+        if (assignment && assignment.playerId === playerId) {
+          const seatNumber = parseInt(seatStr, 10);
+          seats[seatNumber] = {
+            playerId: assignment.playerId,
+            playerName: assignment.playerName,
+            chips: rebuyChips,
+          };
+          GameSeats.setRoomSeats(tableId, seats);
+          await GameSeats.persistRoomSeats(tableId, seats);
+          await publishSeatState(tableId, { seats });
+          break;
+        }
+      }
+
+      await publishRebuyResult(tableId, {
+        tableId,
+        playerId,
+        status: 'accepted',
+        rebuysUsed: trackerRecord.rebuys,
+        stack: rebuyChips,
+      });
+
+      // Check if we can start the next hand now
+      const handStarted = await maybeStartNextHand(tableId, engine);
+
+      return res.status(200).json({
+        success: true,
+        status: 'accepted',
+        rebuysUsed: trackerRecord.rebuys,
+        stack: rebuyChips,
+        nextHandStarted: handStarted,
+      });
+    } else {
+      // Player declined rebuy - stand them up
+      clearPendingRebuy(tableId, playerId);
+
+      // Remove player from game engine
+      if (engine && typeof engine.getState === 'function') {
+        const state = engine.getState();
+        if (state && Array.isArray(state.players)) {
+          // Remove player from the players array immediately if in showdown
+          if (state.stage === 'showdown') {
+            const idx = state.players.findIndex((p: any) => p.id === playerId);
+            if (idx !== -1) {
+              state.players.splice(idx, 1);
+              console.log(`[rebuy-decision] Removed player ${playerId} from game (was at index ${idx})`);
+            }
+          }
+        }
+        // Also mark for removal at next hand start (in case stage changes)
+        if (typeof engine.removePlayer === 'function') {
+          engine.removePlayer(playerId);
+        }
+      }
+
+      // Vacate seat
+      const seats = await GameSeats.loadPersistedRoomSeats(tableId) || GameSeats.getRoomSeats(tableId);
+      for (const [seatStr, assignment] of Object.entries(seats)) {
+        if (assignment?.playerId === playerId) {
+          const seatNumber = parseInt(seatStr, 10);
+          seats[seatNumber] = null;
+          GameSeats.setRoomSeats(tableId, seats);
+          await GameSeats.persistRoomSeats(tableId, seats);
+          await publishSeatVacated(tableId, { seatNumber, playerId, reason: 'rebuy_declined' });
+          await publishSeatState(tableId, { seats });
+          break;
+        }
+      }
+
+      await publishRebuyResult(tableId, {
+        tableId,
+        playerId,
+        status: 'declined',
+      });
+      // The freed seat goes to the waitlist
+      await syncWaitlist(tableId);
+
+      // Check if we can start the next hand now (remaining players may have enough)
+      const handStarted = await maybeStartNextHand(tableId, engine);
+
+      return res.status(200).json({ success: true, status: 'declined', nextHandStarted: handStarted });
+    }
+  } catch (error) {
+    console.error('Error processing rebuy decision:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});

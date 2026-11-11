@@ -1,0 +1,71 @@
+import { ChatService } from '../../../src/lib/services/chat-service';
+import { publishChatDeleted } from '../../../src/lib/realtime/publisher';
+import { getPool } from '../../../src/lib/database/pool';
+import { getRequestAccess, hasPermission, sendPermissionDenied } from '../../../src/lib/auth/access-control';
+import { requirePlayer } from '../../../src/lib/auth/auth-utils';
+import { apiHandler } from '../../../src/lib/api/handler';
+
+export default apiHandler({ methods: 'POST', rateLimit: { windowMs: 60_000, max: 120, message: 'Too many requests' } }, async (req, res) => {
+  // Ownership is checked against the signed-in user; a userId in the body must match the session
+  const userId = await requirePlayer(req, res, req.body?.userId);
+  if (!userId) return;
+
+  try {
+    const { messageId: rawMessageId } = req.body || {};
+    
+    if (!rawMessageId) {
+      return res.status(400).json({ error: 'messageId required' });
+    }
+    
+    const messageId = String(rawMessageId);
+    
+    const pool = getPool();
+    const svc = new ChatService(pool);
+    
+    // Moderators and admins can delete anyone's message
+    const access = await getRequestAccess(req);
+    const isAdmin = hasPermission(access, 'chat.delete_any');
+
+    // Get the message before deletion to get roomId for broadcast
+    const message = await svc.getMessage(messageId);
+    if (!message) {
+      return res.status(404).json({ error: 'message not found' });
+    }
+
+    // Check authorization: user must be sender or admin
+    if (message.senderId !== userId && !isAdmin) {
+      return res.status(403).json({ error: 'not authorized to delete this message' });
+    }
+    if (!isAdmin && !hasPermission(access, 'chat.delete_own')) {
+      return sendPermissionDenied(res, 'chat.delete_own', access);
+    }
+    
+    const roomId = message.roomId;
+    
+    // Delete the message
+    const result = await svc.deleteMessage(messageId, userId, isAdmin);
+    
+    // Broadcast via Supabase Realtime
+    if (roomId) {
+      try {
+        await publishChatDeleted(roomId, { messageId, deletedBy: userId });
+      } catch {
+        // Continue if Supabase broadcast fails
+      }
+    }
+    
+    return res.status(200).json(result);
+  } catch (err: unknown) {
+    const error = err as Error;
+    const message = error?.message || 'Bad request';
+    
+    if (message === 'not authorized to delete this message') {
+      return res.status(403).json({ error: message });
+    }
+    if (message === 'message not found') {
+      return res.status(404).json({ error: message });
+    }
+    
+    return res.status(400).json({ error: message });
+  }
+});

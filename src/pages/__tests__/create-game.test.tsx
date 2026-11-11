@@ -1,0 +1,284 @@
+import React from 'react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+
+// Mock next/router
+jest.mock('next/router', () => ({
+  useRouter: () => ({
+    push: jest.fn(),
+    replace: jest.fn(),
+    prefetch: jest.fn(),
+  }),
+}));
+
+// Import the component after mocks
+import CreateGameRoomPage from '../../../pages/game/create';
+
+describe('CreateGameRoomPage', () => {
+  beforeEach(() => {
+    // Mock localStorage
+    Object.defineProperty(window, 'localStorage', {
+      value: {
+        getItem: jest.fn(() => 'test-token'),
+        setItem: jest.fn(),
+        removeItem: jest.fn(),
+      },
+      writable: true,
+    });
+  });
+
+  it('should not display Table name field', () => {
+    render(<CreateGameRoomPage />);
+    
+    // Verify that "Table name" label does not exist in the document
+    const tableNameLabel = screen.queryByText('Table name');
+    expect(tableNameLabel).toBeNull();
+  });
+
+  it('points to the Tournaments page instead of setting up a tournament here', () => {
+    render(<CreateGameRoomPage />);
+
+    expect(screen.queryByLabelText('Enable tournament structure')).toBeNull();
+    // The page links there from the form, and the top navigation links there too
+    for (const link of screen.getAllByRole('link', { name: 'Tournaments' })) expect(link.getAttribute('href')).toBe('/tournaments');
+  });
+});
+
+describe('CreateGameRoomPage - Big Blind auto-update', () => {
+  beforeEach(() => {
+    // Mock localStorage
+    Object.defineProperty(window, 'localStorage', {
+      value: {
+        getItem: jest.fn(() => 'test-token'),
+        setItem: jest.fn(),
+        removeItem: jest.fn(),
+      },
+      writable: true,
+    });
+  });
+
+  const getSmallBlindInput = () => {
+    const labels = screen.getAllByText('Small blind');
+    const label = labels[0];
+    return label.parentElement?.querySelector('input') as HTMLInputElement;
+  };
+
+  const getBigBlindInput = () => {
+    const labels = screen.getAllByText('Big blind');
+    const label = labels[0];
+    return label.parentElement?.querySelector('input') as HTMLInputElement;
+  };
+
+  it('should initialize with small blind 1 and big blind 2', () => {
+    render(<CreateGameRoomPage />);
+    
+    const smallBlindInput = getSmallBlindInput();
+    const bigBlindInput = getBigBlindInput();
+    
+    expect(smallBlindInput.value).toBe('1');
+    expect(bigBlindInput.value).toBe('2');
+  });
+
+  it('should auto-update big blind to 2x small blind when small blind changes', () => {
+    render(<CreateGameRoomPage />);
+    
+    const smallBlindInput = getSmallBlindInput();
+    const bigBlindInput = getBigBlindInput();
+    
+    // Change small blind to 5
+    fireEvent.change(smallBlindInput, { target: { value: '5' } });
+    
+    // Big blind should auto-update to 10 (5 * 2)
+    expect(bigBlindInput.value).toBe('10');
+  });
+
+  it('should not auto-update big blind when it has been manually changed', () => {
+    render(<CreateGameRoomPage />);
+    
+    const smallBlindInput = getSmallBlindInput();
+    const bigBlindInput = getBigBlindInput();
+    
+    // Manually change big blind first
+    fireEvent.change(bigBlindInput, { target: { value: '5' } });
+    expect(bigBlindInput.value).toBe('5');
+    
+    // Now change small blind to 10
+    fireEvent.change(smallBlindInput, { target: { value: '10' } });
+    
+    // Big blind should NOT auto-update because it was manually set
+    expect(bigBlindInput.value).toBe('5');
+  });
+
+  it('should update big blind to 2x small blind for multiple changes when not manually updated', () => {
+    render(<CreateGameRoomPage />);
+    
+    const smallBlindInput = getSmallBlindInput();
+    const bigBlindInput = getBigBlindInput();
+    
+    // Change small blind to 3
+    fireEvent.change(smallBlindInput, { target: { value: '3' } });
+    expect(bigBlindInput.value).toBe('6');
+    
+    // Change small blind to 10
+    fireEvent.change(smallBlindInput, { target: { value: '10' } });
+    expect(bigBlindInput.value).toBe('20');
+    
+    // Change small blind to 0.5
+    fireEvent.change(smallBlindInput, { target: { value: '0.5' } });
+    expect(bigBlindInput.value).toBe('1');
+  });
+
+  it('should have a buy-in field with default value of 1000', () => {
+    render(<CreateGameRoomPage />);
+    
+    // Find the Buy-In input by looking for the label text and then finding the input in the same container
+    const buyInLabel = screen.getByText('Buy-in');
+    const buyInContainer = buyInLabel.parentElement;
+    const buyInInput = buyInContainer?.querySelector('input[type="number"]') as HTMLInputElement;
+    
+    expect(buyInInput).toBeTruthy();
+    expect(buyInInput.value).toBe('1000');
+  });
+
+  it('should allow changing the buy-in value', () => {
+    render(<CreateGameRoomPage />);
+    
+    const buyInLabel = screen.getByText('Buy-in');
+    const buyInContainer = buyInLabel.parentElement;
+    const buyInInput = buyInContainer?.querySelector('input[type="number"]') as HTMLInputElement;
+    
+    // Change buy-in to 2000
+    fireEvent.change(buyInInput, { target: { value: '2000' } });
+    expect(buyInInput.value).toBe('2000');
+    
+    // Change buy-in to 500
+    fireEvent.change(buyInInput, { target: { value: '500' } });
+    expect(buyInInput.value).toBe('500');
+  });
+});
+
+describe('CreateGameRoomPage - Rebuy Amount Field', () => {
+  beforeEach(() => {
+    // Mock localStorage
+    Object.defineProperty(window, 'localStorage', {
+      value: {
+        getItem: jest.fn(() => 'test-token'),
+        setItem: jest.fn(),
+        removeItem: jest.fn(),
+      },
+      writable: true,
+    });
+  });
+
+  const getNumberOfRebuysSelect = () => {
+    const labels = screen.getAllByText('Number of rebuys');
+    const label = labels[0];
+    return label.parentElement?.querySelector('select') as HTMLSelectElement;
+  };
+
+  const getRebuyAmountInput = () => {
+    try {
+      const labels = screen.getAllByText('Rebuy amount (chips)');
+      const label = labels[0];
+      return label.parentElement?.querySelector('input') as HTMLInputElement;
+    } catch (err) {
+      return null;
+    }
+  };
+
+  it('should show rebuy amount field when numberOfRebuys is unlimited', () => {
+    render(<CreateGameRoomPage />);
+    
+    const rebuyAmountInput = getRebuyAmountInput();
+    expect(rebuyAmountInput).not.toBeNull();
+    expect(rebuyAmountInput?.value).toBe('20');
+  });
+
+  it('should not show rebuy amount field when numberOfRebuys is 0', () => {
+    render(<CreateGameRoomPage />);
+    
+    const numberOfRebuysSelect = getNumberOfRebuysSelect();
+    fireEvent.change(numberOfRebuysSelect, { target: { value: '0' } });
+    
+    const rebuyAmountInput = getRebuyAmountInput();
+    expect(rebuyAmountInput).toBeNull();
+  });
+
+  it('should show rebuy amount field when numberOfRebuys is greater than 0', () => {
+    render(<CreateGameRoomPage />);
+    
+    const numberOfRebuysSelect = getNumberOfRebuysSelect();
+    fireEvent.change(numberOfRebuysSelect, { target: { value: '3' } });
+    
+    const rebuyAmountInput = getRebuyAmountInput();
+    expect(rebuyAmountInput).not.toBeNull();
+    expect(rebuyAmountInput?.value).toBe('20');
+  });
+
+  it('should keep rebuy amount field visible when changing from numeric to unlimited', () => {
+    render(<CreateGameRoomPage />);
+    
+    const numberOfRebuysSelect = getNumberOfRebuysSelect();
+    
+    // First set to a numeric value
+    fireEvent.change(numberOfRebuysSelect, { target: { value: '5' } });
+    let rebuyAmountInput = getRebuyAmountInput();
+    expect(rebuyAmountInput).not.toBeNull();
+    
+    // Then change to unlimited - field should still be visible
+    fireEvent.change(numberOfRebuysSelect, { target: { value: 'unlimited' } });
+    rebuyAmountInput = getRebuyAmountInput();
+    expect(rebuyAmountInput).not.toBeNull();
+  });
+
+  it('should allow changing rebuy amount value', () => {
+    render(<CreateGameRoomPage />);
+    
+    const numberOfRebuysSelect = getNumberOfRebuysSelect();
+    fireEvent.change(numberOfRebuysSelect, { target: { value: '2' } });
+    
+    const rebuyAmountInput = getRebuyAmountInput();
+    expect(rebuyAmountInput).not.toBeNull();
+    
+    if (rebuyAmountInput) {
+      fireEvent.change(rebuyAmountInput, { target: { value: '50' } });
+      expect(rebuyAmountInput.value).toBe('50');
+    }
+  });
+});
+
+describe('CreateGameRoomPage - permissions', () => {
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    Object.defineProperty(window, 'localStorage', {
+      value: { getItem: jest.fn(() => 'test-token'), setItem: jest.fn(), removeItem: jest.fn() },
+      writable: true,
+    });
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  const withPermissions = (permissions: string[]) => {
+    global.fetch = jest.fn(async () => ({ ok: true, json: async () => ({ permissions }) })) as any;
+  };
+
+  it('turns away users without room.create, who can reach the page by its URL', async () => {
+    withPermissions(['table.join', 'game.play']);
+    render(<CreateGameRoomPage />);
+
+    expect((await screen.findByRole('alert')).textContent).toContain('Your account can\'t create rooms');
+    expect(screen.queryByText('Who can join')).toBeNull();
+    expect(screen.getByRole('link', { name: 'Back to the dashboard' }).getAttribute('href')).toBe('/dashboard');
+  });
+
+  it('shows the form to users with room.create', async () => {
+    withPermissions(['room.create', 'room.create_private']);
+    render(<CreateGameRoomPage />);
+
+    await waitFor(() => expect(global.fetch).toHaveBeenCalled());
+    expect(screen.getByText('Who can join')).toBeTruthy();
+    expect(screen.queryByText(/Your account can't create rooms/)).toBeNull();
+  });
+});

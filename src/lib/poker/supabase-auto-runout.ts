@@ -1,0 +1,284 @@
+import { TableState, Card } from '../../types/poker';
+import { isStudVariant } from './variant-rules';
+import { isAutoRunoutEligible } from './run-it-twice-manager';
+
+type BroadcastFn = (state: TableState, lastAction: { action: string; [key: string]: any }) => Promise<void>;
+type EngineLike = {
+  getState: () => TableState;
+  previewRabbitHunt?: (street: 'flop' | 'turn' | 'river') => { cards?: any[] } | void;
+  runItTwiceNow?: () => void;
+  finalizeToShowdown?: () => void;
+  runStudAllInToShowdown?: () => void;
+  runStudAllInStreet?: () => void;
+  prepareRabbitPreview?: (opts?: { community?: Card[]; known?: Card[] }) => void;
+  setAutoRunoutProgress?: (stage: TableState['stage'], communityCards: Card[]) => void;
+  revealRunItTwiceStep?: () => boolean;
+};
+
+type TimerMap = Map<string, NodeJS.Timeout[]>;
+export const AUTO_RUNOUT_DELAY_MS = 3000;
+// Pause between streets when the board is run more than once, so several runs fit in one request
+export const RUN_IT_TWICE_STEP_DELAY_MS = 2000;
+
+const getTimerMap = (): TimerMap => {
+  const globalObj = global as any;
+  if (!globalObj.__supabaseAutoRunoutTimers) {
+    globalObj.__supabaseAutoRunoutTimers = new Map<string, NodeJS.Timeout[]>();
+  }
+  return globalObj.__supabaseAutoRunoutTimers;
+};
+
+export const clearSupabaseAutoRunout = (tableId: string): void => {
+  const timers = getTimerMap().get(tableId);
+  if (timers && timers.length) {
+    timers.forEach((t) => clearTimeout(t));
+  }
+  getTimerMap().delete(tableId);
+};
+
+const finalizeRunout = async (tableId: string, engine: EngineLike, broadcast: BroadcastFn) => {
+  try {
+    const state = engine.getState();
+    const ritEnabled = !!state.runItTwice?.enabled;
+    try {
+      if (ritEnabled && typeof engine.runItTwiceNow === 'function') {
+        engine.runItTwiceNow();
+      } else if (typeof engine.finalizeToShowdown === 'function') {
+        engine.finalizeToShowdown();
+      }
+    } catch {
+      if (typeof engine.finalizeToShowdown === 'function') {
+        try { engine.finalizeToShowdown(); } catch { /* ignore */ }
+      }
+    }
+    const finalState = engine.getState();
+    const resolved: TableState = {
+      ...finalState,
+      stage: finalState.stage || 'showdown',
+      activePlayer: '' as any,
+    };
+    await broadcast(resolved, { action: 'auto_runout_showdown' });
+  } finally {
+    clearSupabaseAutoRunout(tableId);
+  }
+};
+
+const revealStreet = async (
+  tableId: string,
+  street: 'flop' | 'turn' | 'river',
+  engine: EngineLike,
+  broadcast: BroadcastFn,
+  timers: NodeJS.Timeout[],
+) => {
+  try {
+    const current = engine.getState();
+    if (current.stage === 'showdown') {
+      clearSupabaseAutoRunout(tableId);
+      return;
+    }
+    if (typeof engine.previewRabbitHunt !== 'function') {
+      clearSupabaseAutoRunout(tableId);
+      return;
+    }
+    const preview = engine.previewRabbitHunt(street) as { cards?: any[] } | void;
+    const cards = preview && Array.isArray(preview.cards) ? preview.cards : [];
+    
+    // Keep engine's community in sync so subsequent previews compute correct deltas
+    let projectedCommunity: Card[];
+    try {
+      const es = engine.getState();
+      if (Array.isArray(es?.communityCards) && Array.isArray(cards) && cards.length > 0) {
+        es.communityCards.push(...cards);
+      }
+      // Use engine's accumulated state after sync
+      projectedCommunity = Array.isArray(es?.communityCards)
+        ? [...es.communityCards]
+        : Array.isArray(current.communityCards)
+          ? [...current.communityCards, ...cards]
+          : cards;
+    } catch {
+      // If sync fails, fall back to manual accumulation
+      projectedCommunity = Array.isArray(current.communityCards)
+        ? [...current.communityCards, ...cards]
+        : cards;
+    }
+    const staged: TableState = {
+      ...current,
+      communityCards: projectedCommunity,
+      stage: street === 'flop' ? 'flop' : street === 'turn' ? 'turn' : 'river',
+      activePlayer: '' as any,
+    };
+    engine.setAutoRunoutProgress?.(staged.stage, staged.communityCards);
+    await broadcast(staged, { action: `auto_runout_${street}` });
+    if (street === 'river') {
+      const finalizeTimer = setTimeout(() => {
+        finalizeRunout(tableId, engine, broadcast).catch(() => clearSupabaseAutoRunout(tableId));
+      }, AUTO_RUNOUT_DELAY_MS);
+      timers.push(finalizeTimer);
+    }
+  } catch {
+    clearSupabaseAutoRunout(tableId);
+  }
+};
+
+/**
+ * Runs auto-runout synchronously with awaited delays between reveals.
+ * This version works in serverless/API route contexts where timers may not fire.
+ */
+export const runSupabaseAutoRunoutSync = async (
+  tableId: string,
+  engine: EngineLike,
+  broadcast: BroadcastFn,
+  delayMs = AUTO_RUNOUT_DELAY_MS,
+): Promise<boolean> => {
+  try {
+    const state = engine?.getState?.();
+    if (!state) return false;
+    if (!isAutoRunoutEligible(state)) return false;
+    if (state.runItTwicePrompt) return false;
+    if (state.runItTwice?.enabled && typeof engine.revealRunItTwiceStep === 'function') {
+      // Every run's board is already dealt; show run 1 street by street, then run 2, and so on
+      const stepDelay = delayMs > 0 ? Math.min(delayMs, RUN_IT_TWICE_STEP_DELAY_MS) : 0;
+      clearSupabaseAutoRunout(tableId);
+      for (let steps = 0; steps < 20; steps++) {
+        if (stepDelay > 0) await new Promise(resolve => setTimeout(resolve, stepDelay));
+        // The run about to get its next street
+        const run = (engine.getState().runItTwice?.revealed || []).findIndex(n => n < 5);
+        if (!engine.revealRunItTwiceStep()) break;
+        await broadcast({ ...engine.getState(), activePlayer: '' }, { action: 'run_it_twice_reveal', run: run + 1 });
+      }
+      if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+      await finalizeRunout(tableId, engine, broadcast);
+      return true;
+    }
+    const variant = state.variant;
+    if (isStudVariant(variant)) {
+      // Deal one street at a time so each card is seen before the next, then settle the hand
+      if (typeof engine.runStudAllInStreet !== 'function') return false;
+      for (let streets = 0; engine.getState().stage !== 'showdown' && streets < 6; streets++) {
+        if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+        engine.runStudAllInStreet();
+        const current = engine.getState();
+        const action = current.stage === 'showdown' ? 'auto_runout_showdown' : `auto_runout_${current.stage}`;
+        await broadcast({ ...current, activePlayer: '' }, { action });
+      }
+      return true;
+    }
+    const communityLen = Array.isArray(state.communityCards) ? state.communityCards.length : 0;
+    const steps: Array<'flop' | 'turn' | 'river'> = [];
+    if (communityLen < 3) steps.push('flop');
+    if (communityLen < 4) steps.push('turn');
+    if (communityLen < 5) steps.push('river');
+    if (!steps.length) return false;
+    if (typeof engine.previewRabbitHunt !== 'function') return false;
+
+    try {
+      const known = state.players?.flatMap((p: any) => p.holeCards || []) || [];
+      engine.prepareRabbitPreview?.({ community: state.communityCards, known });
+    } catch {
+      // preview preparation is best-effort
+    }
+
+    clearSupabaseAutoRunout(tableId);
+
+    // Run reveals sequentially with delays
+    for (const street of steps) {
+      // Preserve a short pause between each revealed street.
+      if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+      
+      // Reveal the street
+      const current = engine.getState();
+      if (current.stage === 'showdown') break;
+      if (typeof engine.previewRabbitHunt !== 'function') break;
+      
+      const preview = engine.previewRabbitHunt(street) as { cards?: any[] } | void;
+      const cards = preview && Array.isArray(preview.cards) ? preview.cards : [];
+      
+      // Keep engine's community in sync
+      let projectedCommunity: Card[];
+      try {
+        const es = engine.getState();
+        if (Array.isArray(es?.communityCards) && Array.isArray(cards) && cards.length > 0) {
+          es.communityCards.push(...cards);
+        }
+        // Use engine's accumulated state after sync
+        projectedCommunity = Array.isArray(es?.communityCards)
+          ? [...es.communityCards]
+          : Array.isArray(current.communityCards)
+            ? [...current.communityCards, ...cards]
+            : cards;
+      } catch {
+        // If sync fails, fall back to manual accumulation
+        projectedCommunity = Array.isArray(current.communityCards)
+          ? [...current.communityCards, ...cards]
+          : cards;
+      }
+      const staged: TableState = {
+        ...current,
+        communityCards: projectedCommunity,
+        stage: street === 'flop' ? 'flop' : street === 'turn' ? 'turn' : 'river',
+        activePlayer: '' as any,
+      };
+      engine.setAutoRunoutProgress?.(staged.stage, staged.communityCards);
+      await broadcast(staged, { action: `auto_runout_${street}` });
+    }
+
+    // Pause before revealing the showdown result.
+    if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+    await finalizeRunout(tableId, engine, broadcast);
+    
+    return true;
+  } catch (err) {
+    console.error('[auto-runout] Error in sync runout:', err);
+    clearSupabaseAutoRunout(tableId);
+    return false;
+  }
+};
+
+export const scheduleSupabaseAutoRunout = (
+  tableId: string,
+  engine: EngineLike,
+  broadcast: BroadcastFn,
+): boolean => {
+  try {
+    const state = engine?.getState?.();
+    if (!state) return false;
+    if (!isAutoRunoutEligible(state)) return false;
+    if (state.runItTwicePrompt) return false;
+    const variant = state.variant;
+    if (isStudVariant(variant)) {
+      return false;
+    }
+    const communityLen = Array.isArray(state.communityCards) ? state.communityCards.length : 0;
+    const steps: Array<'flop' | 'turn' | 'river'> = [];
+    if (communityLen < 3) steps.push('flop');
+    if (communityLen < 4) steps.push('turn');
+    if (communityLen < 5) steps.push('river');
+    if (!steps.length) return false;
+    if (typeof engine.previewRabbitHunt !== 'function') return false;
+
+    try {
+      const known = state.players?.flatMap((p: any) => p.holeCards || []) || [];
+      engine.prepareRabbitPreview?.({ community: state.communityCards, known });
+    } catch {
+      // preview preparation is best-effort
+    }
+
+    clearSupabaseAutoRunout(tableId);
+    const timers: NodeJS.Timeout[] = [];
+    getTimerMap().set(tableId, timers);
+
+    let delay = AUTO_RUNOUT_DELAY_MS;
+    steps.forEach((street) => {
+      const timer = setTimeout(() => {
+        revealStreet(tableId, street, engine, broadcast, timers).catch(() => clearSupabaseAutoRunout(tableId));
+      }, delay);
+      timers.push(timer);
+      delay += AUTO_RUNOUT_DELAY_MS;
+    });
+    return true;
+  } catch {
+    clearSupabaseAutoRunout(tableId);
+    return false;
+  }
+};
